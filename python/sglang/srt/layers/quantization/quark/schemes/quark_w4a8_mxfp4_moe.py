@@ -54,25 +54,27 @@ _use_tokenspeed_moe = get_bool_env_var("SGLANG_USE_TOKENSPEED_MOE") and _is_hip
 # before SGLang has fully initialized `triton`. So the import is done LAZILY
 # from within the scheme methods (which only run after full engine boot), not
 # at module import time. Cached in these globals after first success.
-_ts_gluon_precomputed_moe = None
+_ts_gluon_fused_moe = None
 _ts_preprocess_moe_weights = None
 
 
 def _load_tokenspeed_moe():
     """Lazily import the tokenspeed MoE kernels. Returns True on success.
     Disables the tokenspeed path (falling back to AITER) on failure."""
-    global _use_tokenspeed_moe, _ts_gluon_precomputed_moe, _ts_preprocess_moe_weights
-    if _ts_gluon_precomputed_moe is not None:
+    global _use_tokenspeed_moe, _ts_gluon_fused_moe, _ts_preprocess_moe_weights
+    if _ts_gluon_fused_moe is not None:
         return True
     try:
+        # FP8-activation routed fused MoE: uses the small-M warp-decode fast
+        # path and matches SGLang's softmax-topk routing (validated cos=1.0).
         from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
-            gluon_mxfp_precomputed_mxfp4_fused_moe as _moe,
+            gluon_mxfp_fused_moe as _moe,
         )
         from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
             preprocess_gluon_mxfp4_gfx950_moe_weights as _prep,
         )
 
-        _ts_gluon_precomputed_moe = _moe
+        _ts_gluon_fused_moe = _moe
         _ts_preprocess_moe_weights = _prep
         logger.info(
             "SGLANG_USE_TOKENSPEED_MOE enabled: gpt-oss MoE will use "
@@ -425,6 +427,10 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         layer.ts_w2_weight = carrier.w2_weight_triton_tensor
         layer.ts_w13_mx_scale = carrier.w13_precision_config.b_mx_scale
         layer.ts_w2_mx_scale = carrier.w2_precision_config.b_mx_scale
+        # Per-tensor FP8 activation scales computed by the preprocess. Required
+        # by the FP8-routed fused MoE (its small-M warp-decode fast path).
+        layer.ts_w13_act_scale = getattr(carrier, "w13_act_scale", None)
+        layer.ts_w2_act_scale = getattr(carrier, "w2_act_scale", None)
         layer.ts_w13_bias = getattr(carrier, "w13_weight_bias", None)
         layer.ts_w2_bias = getattr(carrier, "w2_weight_bias", None)
         layer.ts_swiglu_limit = float(
@@ -472,7 +478,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         if (
             _use_tokenspeed_moe
             and getattr(layer, "_tokenspeed_moe_ready", False)
-            and _ts_gluon_precomputed_moe is not None
+            and _ts_gluon_fused_moe is not None
         ):
             return self._apply_weights_tokenspeed(layer, dispatch_output)
 
@@ -538,8 +544,11 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids
+        # FP8-routed fused MoE does its own softmax-topk routing from the raw
+        # router logits (validated to match SGLang's routing, cos=1.0) and can
+        # take the small-M warp-decode fast path. Fall back to precomputed topk
+        # only if router_logits is unavailable.
+        router_logits = getattr(topk_output, "router_logits", None)
 
         # SGLang pads hidden_size (2880 -> 3072) in create_weights, so the
         # tokenspeed-preprocessed weights expect padded activations. Pad the
@@ -550,14 +559,17 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 hidden_states, (0, self.hidden_pad), mode="constant", value=0.0
             )
 
-        out = _ts_gluon_precomputed_moe(
+        top_k = int(topk_output.topk_ids.shape[-1])
+        out = _ts_gluon_fused_moe(
             hidden_states,
-            topk_weights.to(torch.bfloat16),
-            topk_ids.to(torch.int32),
+            router_logits,
             layer.ts_w13_weight,
             layer.ts_w2_weight,
             w13_mx_scale=layer.ts_w13_mx_scale,
             w2_mx_scale=layer.ts_w2_mx_scale,
+            w13_act_scale=layer.ts_w13_act_scale,
+            w2_act_scale=layer.ts_w2_act_scale,
+            top_k=top_k,
             w13_bias=layer.ts_w13_bias,
             w2_bias=layer.ts_w2_bias,
             out_dtype=hidden_states.dtype,
