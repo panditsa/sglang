@@ -263,6 +263,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "aiter",
     "marlin",
     "humming",
+    "tokenspeed",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [

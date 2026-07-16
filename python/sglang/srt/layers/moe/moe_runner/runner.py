@@ -51,6 +51,12 @@ class MoeRunner:
             from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 
             self.runner_core = AiterRunnerCore(config)
+        elif runner_backend.is_tokenspeed():
+            from sglang.srt.layers.moe.moe_runner.tokenspeed import (
+                TokenspeedRunnerCore,
+            )
+
+            self.runner_core = TokenspeedRunnerCore(config)
         elif runner_backend.is_marlin():
             if lora_enabled:
                 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
