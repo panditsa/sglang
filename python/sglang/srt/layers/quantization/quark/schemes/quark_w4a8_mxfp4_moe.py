@@ -45,6 +45,56 @@ if _use_aiter:
 
 OCP_MX_BLOCK_SIZE = 32
 
+# Opt-in: route this MoE scheme through tokenspeed's gluon MXFP4 kernels
+# (tokenspeed_kernel_amd) instead of the AITER runner. Reversible via env var.
+_use_tokenspeed_moe = get_bool_env_var("SGLANG_USE_TOKENSPEED_MOE") and _is_hip
+
+# tokenspeed_kernel_amd pulls in tokenspeed_triton, whose native modules can
+# trigger triton-custom's (fragile, circular) backend discovery if imported
+# before SGLang has fully initialized `triton`. So the import is done LAZILY
+# from within the scheme methods (which only run after full engine boot), not
+# at module import time. Cached in these globals after first success.
+_ts_gluon_precomputed_moe = None
+_ts_preprocess_moe_weights = None
+
+
+def _load_tokenspeed_moe():
+    """Lazily import the tokenspeed MoE kernels. Returns True on success.
+    Disables the tokenspeed path (falling back to AITER) on failure."""
+    global _use_tokenspeed_moe, _ts_gluon_precomputed_moe, _ts_preprocess_moe_weights
+    if _ts_gluon_precomputed_moe is not None:
+        return True
+    try:
+        from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+            gluon_mxfp_precomputed_mxfp4_fused_moe as _moe,
+        )
+        from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
+            preprocess_gluon_mxfp4_gfx950_moe_weights as _prep,
+        )
+
+        _ts_gluon_precomputed_moe = _moe
+        _ts_preprocess_moe_weights = _prep
+        logger.info(
+            "SGLANG_USE_TOKENSPEED_MOE enabled: gpt-oss MoE will use "
+            "tokenspeed_kernel_amd gluon MXFP4 kernels."
+        )
+        return True
+    except Exception as _e:  # pragma: no cover - env-dependent
+        _use_tokenspeed_moe = False
+        logger.warning(
+            "SGLANG_USE_TOKENSPEED_MOE set but tokenspeed_kernel_amd import "
+            "failed (%s); falling back to AITER MoE.",
+            _e,
+        )
+        return False
+
+
+class _TokenspeedMoEModule(torch.nn.Module):
+    """Carrier exposing the attribute names tokenspeed's
+    preprocess_gluon_mxfp4_gfx950_moe_weights expects."""
+
+    pass
+
 
 class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
     """Quark MoE scheme for MXFP4 weights with static FP8 activations."""
@@ -241,6 +291,9 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _use_tokenspeed_moe and _load_tokenspeed_moe():
+            self._process_weights_tokenspeed(layer)
+            return
         # Mirror native MXFP4 post-load shuffling. The default
         # `SGLANG_USE_AITER_MOE_GU_ITLV=1` path uses the gate-up-aware
         # a16w4 layout; the `=0` fallback keeps the separated gate/up layout.
@@ -325,6 +378,65 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             # Weights are stored as torch.uint8 but semantically MXFP4
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
+    def _process_weights_tokenspeed(self, layer: torch.nn.Module) -> None:
+        """Convert the raw Quark MXFP4 MoE weights into tokenspeed's gluon
+        layout and attach the tokenspeed runtime tensors to `layer`.
+
+        Runs on the pre-AITER-shuffle weights: the Quark loader writes the
+        SEPARATED gate/up layout `[g0.., u0..]` per expert, which tokenspeed
+        treats as `w13_input_layout="concatenated"`.
+        """
+        if layer.w13_input_scale is None or layer.w2_input_scale is None:
+            raise ValueError("W4A8 MXFP4-FP8 MoE requires static input scales.")
+
+        carrier = _TokenspeedMoEModule()
+        carrier.w13_weight = torch.nn.Parameter(
+            layer.w13_weight.data.contiguous(), requires_grad=False
+        )
+        carrier.w13_weight_scale = torch.nn.Parameter(
+            layer.w13_weight_scale.data.contiguous(), requires_grad=False
+        )
+        carrier.w2_weight = torch.nn.Parameter(
+            layer.w2_weight.data.contiguous(), requires_grad=False
+        )
+        carrier.w2_weight_scale = torch.nn.Parameter(
+            layer.w2_weight_scale.data.contiguous(), requires_grad=False
+        )
+        carrier.w13_input_scale = torch.nn.Parameter(
+            layer.w13_input_scale.data.to(torch.float32), requires_grad=False
+        )
+        carrier.w2_input_scale = torch.nn.Parameter(
+            layer.w2_input_scale.data.to(torch.float32), requires_grad=False
+        )
+        if getattr(layer, "w13_weight_bias", None) is not None:
+            carrier.w13_weight_bias = torch.nn.Parameter(
+                layer.w13_weight_bias.data.to(torch.float32), requires_grad=False
+            )
+        if getattr(layer, "w2_weight_bias", None) is not None:
+            carrier.w2_weight_bias = torch.nn.Parameter(
+                layer.w2_weight_bias.data.to(torch.float32), requires_grad=False
+            )
+        carrier.w13_input_layout = "concatenated"
+
+        _ts_preprocess_moe_weights(plan={}, w=carrier, preshuffle=True)
+
+        # Stash tokenspeed runtime tensors; free the original big params.
+        layer.ts_w13_weight = carrier.w13_weight_triton_tensor
+        layer.ts_w2_weight = carrier.w2_weight_triton_tensor
+        layer.ts_w13_mx_scale = carrier.w13_precision_config.b_mx_scale
+        layer.ts_w2_mx_scale = carrier.w2_precision_config.b_mx_scale
+        layer.ts_w13_bias = getattr(carrier, "w13_weight_bias", None)
+        layer.ts_w2_bias = getattr(carrier, "w2_weight_bias", None)
+        layer.ts_swiglu_limit = float(
+            getattr(self, "swiglu_limit", 0.0) or 0.0
+        )
+        layer._tokenspeed_moe_ready = True
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config(
+                {"weight_dtype": torch.float4_e2m1fn_x2}
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -334,6 +446,10 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         )
 
         self.moe_runner_config = moe_runner_config
+        if _use_tokenspeed_moe and _load_tokenspeed_moe():
+            # tokenspeed path does route+dispatch+combine itself; no MoeRunner.
+            self.runner = None
+            return
         moe_runner_backend = get_moe_runner_backend()
         if _use_aiter and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
@@ -353,6 +469,13 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if (
+            _use_tokenspeed_moe
+            and getattr(layer, "_tokenspeed_moe_ready", False)
+            and _ts_gluon_precomputed_moe is not None
+        ):
+            return self._apply_weights_tokenspeed(layer, dispatch_output)
+
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
@@ -405,3 +528,41 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         return self.runner.run(
             dispatch_output._replace(hidden_states=x_padded), quant_info
         )
+
+    def _apply_weights_tokenspeed(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        hidden_states = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
+
+        # SGLang pads hidden_size (2880 -> 3072) in create_weights, so the
+        # tokenspeed-preprocessed weights expect padded activations. Pad the
+        # input K to match, then slice the output back to the true hidden size.
+        true_hidden = hidden_states.shape[-1]
+        if self.hidden_pad:
+            hidden_states = torch.nn.functional.pad(
+                hidden_states, (0, self.hidden_pad), mode="constant", value=0.0
+            )
+
+        out = _ts_gluon_precomputed_moe(
+            hidden_states,
+            topk_weights.to(torch.bfloat16),
+            topk_ids.to(torch.int32),
+            layer.ts_w13_weight,
+            layer.ts_w2_weight,
+            w13_mx_scale=layer.ts_w13_mx_scale,
+            w2_mx_scale=layer.ts_w2_mx_scale,
+            w13_bias=layer.ts_w13_bias,
+            w2_bias=layer.ts_w2_bias,
+            out_dtype=hidden_states.dtype,
+            swiglu_limit=layer.ts_swiglu_limit or 7.0,
+        )
+        if out.shape[-1] != true_hidden:
+            out = out[..., :true_hidden].contiguous()
+        return StandardCombineInput(hidden_states=out)
