@@ -245,10 +245,45 @@ class TokenspeedAttnBackend(AttentionBackend):
             )
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k_cache, v_cache = self._kv_caches_paged(layer.layer_id)
 
         seq_lens = forward_batch.seq_lens
         extend_seq_lens = forward_batch.extend_seq_lens
+
+        # Pure-prefill fast path: no cached prefix -> run mha_prefill directly on
+        # the current q/k/v (no paged-cache gather). Requires k/v this call and
+        # every request starting from position 0.
+        import os
+
+        _use_prefill = os.environ.get("SGLANG_TS_MHA_PREFILL", "1") == "1"
+        prefix_lens = forward_batch.extend_prefix_lens
+        no_prefix = prefix_lens is None or (
+            int(prefix_lens.max().item()) == 0 if prefix_lens.numel() else True
+        )
+        if _use_prefill and no_prefix and k is not None and v is not None:
+            k_ = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            v_ = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+            cu = torch.zeros(
+                extend_seq_lens.shape[0] + 1, dtype=torch.int32, device=q.device
+            )
+            torch.cumsum(extend_seq_lens.to(torch.int32), dim=0, out=cu[1:])
+            cu_cpu = cu.tolist()
+            max_s = int(extend_seq_lens.max().item()) if extend_seq_lens.numel() else 0
+            res = tk.mha_prefill(
+                q_,
+                k_,
+                v_,
+                cu,
+                cu_cpu,
+                max_seqlen=max_s,
+                window_left=self._window_left(layer),
+                logit_cap=self._logit_cap(layer),
+                sinks=sinks,
+            )
+            out = res.out if hasattr(res, "out") else res
+            return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        k_cache, v_cache = self._kv_caches_paged(layer.layer_id)
+
         # cu_seqlens for query (extend) and kv (full visible cache)
         cu_q = torch.zeros(
             extend_seq_lens.shape[0] + 1, dtype=torch.int32, device=q.device

@@ -94,5 +94,39 @@ fused MoE+attention are large-batch tuned), not in the SGLang integration or
 registry dispatch. Closing it would require kernel-level work in
 tokenspeed_kernel_amd, not backend-side changes.
 
-Still-open (untested) lever: route prefill through tokenspeed mha_prefill
-(currently the extend-with-kvcache path handles prefill).
+## mha_prefill + full kernel validation (added)
+
+### Registry kernels validated correct in isolation (cos=1.0 vs torch SDPA)
+
+- mha_prefill: cos=1.0000 across causal, sliding-window (S=300 >> win=128),
+  batched ragged seqs, attention sinks.
+- mha_decode_with_kvcache: cos=1.0000 at S = 16,32,64,80,96,128,160,200,256,400
+  for both sliding-window and full attention, with sinks + GQA 64:8.
+=> The tokenspeed MHA kernels themselves are numerically correct at all lengths.
+
+### KNOWN BUG in the attention backend integration (hybrid SWA pool)
+
+End-to-end, the tokenspeed attention backend produces correct output for very
+short prompts (<= ~80 total tokens: e.g. 17x23=391, capital of France=Paris)
+but DEGENERATES into repetition/looping on longer prompts (>= ~84 tokens),
+e.g. summing a 6-number list. The aiter backend answers the identical prompt
+correctly, so this is specific to the tokenspeed backend.
+
+Root cause (identified): GPT-OSS alternates sliding-window and full-attention
+layers and SGLang stores sliding-window layers in a SEPARATE SWA KV pool with
+its own token indexing. The current TokenspeedAttnBackend uses the full-attention
+req_to_token map as the page_table for ALL layers, so the sliding-window layers
+read from the wrong KV slots once the sequence grows. First generated token is
+correct (prefill ok); decode drifts as the hybrid-pool mismatch compounds.
+mha_prefill vs mha_extend made no difference (A/B via SGLANG_TS_MHA_PREFILL=0/1),
+confirming it is the SWA read-path, not the prefill entry.
+
+Fix required (backend-side, not kernel-side): per-layer KV routing that reads
+the SWA pool + SWA page table for sliding-window layers and the full pool for
+full-attention layers (mirror aiter_backend's dual-pool handling), including the
+CUDA-graph static buffers. This is the next step to make the tokenspeed
+attention backend production-correct for GPT-OSS.
+
+Status: MoE runner backend is correct and shippable. Attention backend is
+correct for short-context but needs the SWA dual-pool fix before it is
+correct for general prompts.
