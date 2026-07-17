@@ -215,6 +215,7 @@ ATTENTION_BACKEND_CHOICES = [
     "aiter",
     "wave",
     "tokenspeed",
+    "tokenspeed_verify",
     # Other platforms
     "intel_amx",
     "ascend",
@@ -4419,6 +4420,7 @@ class ServerArgs:
                 "intel_xpu",
                 "aiter",
                 "tokenspeed",
+                "tokenspeed_verify",
             ]
             prefill_attn_backend, decode_attn_backend = (
                 self._resolved_attention_backends()

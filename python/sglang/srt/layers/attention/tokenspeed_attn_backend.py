@@ -233,7 +233,10 @@ class TokenspeedAttnBackend(AttentionBackend):
     def _window_left(layer: RadixAttention) -> int:
         sw = layer.sliding_window_size
         if sw is not None and sw > 0:
-            return int(sw)
+            import os
+
+            off = int(os.environ.get("TS_WINDOW_OFFSET", "0"))
+            return int(sw) + off
         return -1
 
     @staticmethod

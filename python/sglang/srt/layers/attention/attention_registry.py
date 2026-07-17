@@ -108,6 +108,15 @@ def create_tokenspeed_backend(runner):
     return TokenspeedAttnBackend(runner)
 
 
+@register_attention_backend("tokenspeed_verify")
+def create_tokenspeed_verify_backend(runner):
+    from sglang.srt.layers.attention.tokenspeed_verify_backend import (
+        TokenspeedVerifyBackend,
+    )
+
+    return TokenspeedVerifyBackend(runner)
+
+
 @register_attention_backend("wave")
 def create_wave_backend(runner):
     from sglang.srt.layers.attention.wave_backend import WaveAttnBackend
