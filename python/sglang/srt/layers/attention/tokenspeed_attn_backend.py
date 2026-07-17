@@ -5,8 +5,21 @@ kernels (mha_plan / mha_prefill / mha_extend_with_kvcache /
 mha_decode_with_kvcache). Targets dense MHA models such as GPT-OSS (GQA,
 sliding-window attention, attention sinks) on AMD gfx950.
 
-Uses SGLang's token-indexed KV pool as a page_size=1 paged cache: the
-req_to_token map doubles as the registry page_table.
+Uses SGLang's KV pool as a paged cache: the req_to_token map is strided into
+the registry page_table (page_size configurable).
+
+HYBRID SWA STATUS (GPT-OSS): the model alternates sliding-window and
+full-attention layers stored in separate KV pools. This backend routes each
+layer to its pool (get_key_buffer(layer_id) is pool-aware) and translates the
+sliding-window page table via full_to_swa_index_mapping (same approach as the
+FA3 backend). This is CORRECT for full-attention layers and for short contexts,
+and fixes many mid-length prompts, but a subtle SWA decode mismatch remains at
+certain lengths (some prompts still degrade). Until that is resolved, the
+recommended production config is:
+    --moe-runner-backend tokenspeed --attention-backend aiter
+which is fully correct (7/7 correctness suite). The full tokenspeed attention
+path is functional for short/full-attention-dominant contexts and is the WIP
+target for "gpt-oss fully through tokenspeed".
 """
 
 from dataclasses import dataclass
@@ -39,10 +52,16 @@ def _load_registry():
 
 @dataclass
 class TokenspeedAttnMetadata:
-    # page_table for the running batch: [batch, max_pages_per_seq] (page_size=1)
+    # Full-attention page_table for the batch: [batch, max_pages_per_seq].
     page_table: torch.Tensor
     cache_seqlens: torch.Tensor  # int32 [batch]
     max_seq_len: int
+    # Sliding-window-layer page_table (SWA-pool slot ids) and its own
+    # cache_seqlens/max (capped at the window). Only built when the model uses a
+    # hybrid SWA KV pool; None otherwise.
+    swa_page_table: Optional[torch.Tensor] = None
+    swa_cache_seqlens: Optional[torch.Tensor] = None
+    swa_max_seq_len: int = 0
 
 
 class TokenspeedAttnBackend(AttentionBackend):
@@ -58,6 +77,9 @@ class TokenspeedAttnBackend(AttentionBackend):
         )
         self.swa_out_cache_loc = None
         self.max_context_len = model_runner.model_config.context_len
+        self.sliding_window_size = int(
+            getattr(model_runner.model_config, "sliding_window", 0) or 0
+        )
         # KV paging: registry MHA consumes [num_blocks, page_size, kv_heads, hd].
         # SGLang stores a flat [num_tokens, kv_heads, hd] buffer; with page_size>1
         # we view it as blocks and stride the token-level req_to_token map into a
@@ -84,11 +106,48 @@ class TokenspeedAttnBackend(AttentionBackend):
         max_seq = int(seq_lens.max().item()) if seq_lens.numel() else 0
         req_to_token = self.req_to_token_pool.req_to_token
         token_table = req_to_token[forward_batch.req_pool_indices, :max_seq]
+        swa_page_table = None
+        if self.use_sliding_window_kv_pool:
+            # Sliding-window layers read the SWA pool: translate the full-pool
+            # token slots to SWA slots. Evicted (out-of-window) tokens map to -1;
+            # the kernel's window_left masking never reads them, so the full
+            # table + full seqlens are correct (validated: -1 outside the window
+            # yields finite output).
+            swa_tokens = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                token_table
+            ).to(torch.int32)
+            # Evicted tokens translate to -1; window_left masking excludes those
+            # positions from the softmax, but a -1 page index would still gather
+            # garbage (KV[-1]). Point evicted slots at 0 (a valid, masked slot).
+            swa_tokens = torch.where(
+                swa_tokens < 0, torch.zeros_like(swa_tokens), swa_tokens
+            )
+            swa_page_table = self._to_block_table(swa_tokens)
         self.forward_metadata = TokenspeedAttnMetadata(
             page_table=self._to_block_table(token_table),
             cache_seqlens=seq_lens.to(torch.int32),
             max_seq_len=max_seq,
+            swa_page_table=swa_page_table,
+            swa_cache_seqlens=seq_lens.to(torch.int32),
+            swa_max_seq_len=max_seq,
         )
+
+    @staticmethod
+    def _is_swa_layer(layer: RadixAttention) -> bool:
+        sw = getattr(layer, "sliding_window_size", -1)
+        return sw is not None and sw > 0
+
+    def _page_table_for_layer(self, layer: RadixAttention) -> torch.Tensor:
+        """Return the page table this layer must use: the SWA-slot table for
+        sliding-window layers (when a hybrid SWA pool is active), else full."""
+        md = self.forward_metadata
+        if (
+            self.use_sliding_window_kv_pool
+            and self._is_swa_layer(layer)
+            and md.swa_page_table is not None
+        ):
+            return md.swa_page_table
+        return md.page_table
 
     def _to_block_table(self, token_table: torch.Tensor) -> torch.Tensor:
         """Convert a token-level page table [B, S] into a block-level table
@@ -206,14 +265,26 @@ class TokenspeedAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k_cache, v_cache = self._kv_caches_paged(layer.layer_id)
         md = self.forward_metadata
+        if (
+            self.use_sliding_window_kv_pool
+            and self._is_swa_layer(layer)
+            and md.swa_page_table is not None
+        ):
+            page_table = md.swa_page_table
+            cache_seqlens = md.swa_cache_seqlens
+            max_seqlen_k = md.swa_max_seq_len
+        else:
+            page_table = md.page_table
+            cache_seqlens = md.cache_seqlens
+            max_seqlen_k = md.max_seq_len
 
         res = tk.mha_decode_with_kvcache(
             q_,
             k_cache,
             v_cache,
-            md.page_table,
-            md.cache_seqlens,
-            max_seqlen_k=md.max_seq_len,
+            page_table,
+            cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
             max_seqlen_q=1,
             window_left=self._window_left(layer),
             logit_cap=self._logit_cap(layer),
@@ -297,6 +368,11 @@ class TokenspeedAttnBackend(AttentionBackend):
         req_to_token = self.req_to_token_pool.req_to_token
         max_kv = int(seq_lens.max().item()) if seq_lens.numel() else 0
         token_table = req_to_token[forward_batch.req_pool_indices, :max_kv]
+        if self.use_sliding_window_kv_pool and self._is_swa_layer(layer):
+            # Sliding-window layer reads the SWA pool: translate slots.
+            token_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                token_table
+            ).to(torch.int32)
         page_table = self._to_block_table(token_table)
         max_q = int(extend_seq_lens.max().item()) if extend_seq_lens.numel() else 0
 

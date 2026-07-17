@@ -121,12 +121,40 @@ correct (prefill ok); decode drifts as the hybrid-pool mismatch compounds.
 mha_prefill vs mha_extend made no difference (A/B via SGLANG_TS_MHA_PREFILL=0/1),
 confirming it is the SWA read-path, not the prefill entry.
 
-Fix required (backend-side, not kernel-side): per-layer KV routing that reads
-the SWA pool + SWA page table for sliding-window layers and the full pool for
-full-attention layers (mirror aiter_backend's dual-pool handling), including the
-CUDA-graph static buffers. This is the next step to make the tokenspeed
-attention backend production-correct for GPT-OSS.
+### SWA dual-pool fix attempt (partial)
 
-Status: MoE runner backend is correct and shippable. Attention backend is
-correct for short-context but needs the SWA dual-pool fix before it is
-correct for general prompts.
+Implemented per-layer KV routing mirroring the FA3 backend:
+
+- sliding-window layers translate the page table via full_to_swa_index_mapping
+  and read the SWA pool (get_key_buffer(layer_id) is already pool-aware);
+- full-attention layers use the full pool + full req_to_token page table;
+- evicted (-1) SWA slots are clamped to 0 (masked by window_left anyway).
+
+Result: IMPROVED but not fully robust. Several mid-length prompts that used to
+loop now pass (e.g. 96-sum at 106 tok, 55-sum at 80 tok), but correctness is
+not uniform across all lengths (some 84-106 tok prompts still degrade, and
+results were briefly non-deterministic before the -1 clamp).
+
+Kernel-level facts established (all cos=1.0 vs SDPA):
+
+- mha_decode window_left semantics are correct (win=127 and 128 both match a
+  hand-masked reference with contiguous page tables).
+- The kernel tolerates -1 page entries outside the window (finite output).
+- FA3 uses the identical translate_loc_from_full_to_swa(page_table) approach
+  with the same cache_seqlens and works, so the SWA translation itself is sound.
+
+Remaining suspect: a subtle interaction between the SWA-pool slot ordering and
+the tokenspeed decode kernel's window application at specific lengths. Resolving
+it needs deeper SWA-allocator / kernel tracing than black-box prompt testing.
+
+## Bottom line / recommended config
+
+- MoE runner backend (--moe-runner-backend tokenspeed): CORRECT, shippable.
+  7/7 correctness suite with aiter attention.
+- Attention backend (--attention-backend tokenspeed): correct for
+  short/full-attention-dominant contexts; hybrid-SWA decode has a residual
+  correctness bug at some lengths. WIP.
+- Recommended production config today:
+    --moe-runner-backend tokenspeed --attention-backend aiter   (7/7 correct)
+- "gpt-oss fully through tokenspeed" is functionally wired end-to-end and
+  CUDA-graph capturable; the SWA decode correctness fix is the last open item.
