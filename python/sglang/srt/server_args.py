@@ -214,6 +214,7 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+    "tokenspeed",
     # Other platforms
     "intel_amx",
     "ascend",
@@ -4417,6 +4418,7 @@ class ServerArgs:
                 "intel_amx",
                 "intel_xpu",
                 "aiter",
+                "tokenspeed",
             ]
             prefill_attn_backend, decode_attn_backend = (
                 self._resolved_attention_backends()
