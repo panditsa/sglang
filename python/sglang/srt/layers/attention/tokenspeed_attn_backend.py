@@ -58,6 +58,11 @@ class TokenspeedAttnBackend(AttentionBackend):
         )
         self.swa_out_cache_loc = None
         self.max_context_len = model_runner.model_config.context_len
+        # KV paging: registry MHA consumes [num_blocks, page_size, kv_heads, hd].
+        # SGLang stores a flat [num_tokens, kv_heads, hd] buffer; with page_size>1
+        # we view it as blocks and stride the token-level req_to_token map into a
+        # block-level page table.
+        self.page_size = int(getattr(model_runner.server_args, "page_size", 1) or 1)
         # Static buffers for CUDA-graph decode replay (allocated on demand).
         self._cg_page_table: Optional[torch.Tensor] = None
         self._cg_cache_seqlens: Optional[torch.Tensor] = None
@@ -78,13 +83,23 @@ class TokenspeedAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         max_seq = int(seq_lens.max().item()) if seq_lens.numel() else 0
         req_to_token = self.req_to_token_pool.req_to_token
-        # page_table (page_size=1): token indices per request, [B, max_seq]
-        page_table = req_to_token[forward_batch.req_pool_indices, :max_seq]
+        token_table = req_to_token[forward_batch.req_pool_indices, :max_seq]
         self.forward_metadata = TokenspeedAttnMetadata(
-            page_table=page_table.to(torch.int32),
+            page_table=self._to_block_table(token_table),
             cache_seqlens=seq_lens.to(torch.int32),
             max_seq_len=max_seq,
         )
+
+    def _to_block_table(self, token_table: torch.Tensor) -> torch.Tensor:
+        """Convert a token-level page table [B, S] into a block-level table
+        [B, ceil(S/page_size)] of block ids. Identity when page_size==1."""
+        if self.page_size == 1:
+            return token_table.to(torch.int32)
+        s = token_table.shape[1]
+        strided = torch.arange(
+            0, s, self.page_size, device=token_table.device, dtype=torch.int64
+        )
+        return (token_table[:, strided] // self.page_size).to(torch.int32)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -93,10 +108,11 @@ class TokenspeedAttnBackend(AttentionBackend):
     # CUDA graph support (decode)
     # ------------------------------------------------------------------
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        # Static page_table [max_bs, max_context_len] + cache_seqlens [max_bs]
-        # that captured decode graphs read; filled in-place each replay.
+        # Static block-level page_table + cache_seqlens that captured decode
+        # graphs read; filled in-place each replay.
+        max_blocks = (self.max_context_len + self.page_size - 1) // self.page_size
         self._cg_page_table = torch.zeros(
-            (max_bs, self.max_context_len), dtype=torch.int32, device=self.device
+            (max_bs, max_blocks), dtype=torch.int32, device=self.device
         )
         self._cg_cache_seqlens = torch.ones(
             (max_bs,), dtype=torch.int32, device=self.device
@@ -109,8 +125,9 @@ class TokenspeedAttnBackend(AttentionBackend):
         max_seq = int(self.max_context_len)
         # Fill static buffers in place (addresses stay stable for graph replay).
         self._cg_cache_seqlens[:bs] = seq_lens.to(torch.int32)
-        pt_src = req_to_token[forward_batch.req_pool_indices, :max_seq]
-        self._cg_page_table[:bs, : pt_src.shape[1]] = pt_src.to(torch.int32)
+        token_table = req_to_token[forward_batch.req_pool_indices, :max_seq]
+        block_table = self._to_block_table(token_table)
+        self._cg_page_table[:bs, : block_table.shape[1]] = block_table
         self.forward_metadata = TokenspeedAttnMetadata(
             page_table=self._cg_page_table[:bs],
             cache_seqlens=self._cg_cache_seqlens[:bs],
@@ -139,13 +156,18 @@ class TokenspeedAttnBackend(AttentionBackend):
     # helpers
     # ------------------------------------------------------------------
     def _kv_caches_paged(self, layer_id: int):
-        """Return (k_cache, v_cache) as page_size=1 paged tensors:
-        [num_tokens, 1, num_kv_heads, head_dim]."""
+        """Return (k_cache, v_cache) as paged tensors
+        [num_blocks, page_size, num_kv_heads, head_dim]."""
         k = self.token_to_kv_pool.get_key_buffer(layer_id)
         v = self.token_to_kv_pool.get_value_buffer(layer_id)
-        # SGLang stores [num_tokens, num_kv_heads, head_dim]; add page dim.
-        k = k.unsqueeze(1)
-        v = v.unsqueeze(1)
+        # SGLang stores [num_tokens, num_kv_heads, head_dim].
+        if self.page_size == 1:
+            return k.unsqueeze(1), v.unsqueeze(1)
+        nt, kvh, hd = k.shape
+        nblocks = nt // self.page_size
+        usable = nblocks * self.page_size
+        k = k[:usable].view(nblocks, self.page_size, kvh, hd)
+        v = v[:usable].view(nblocks, self.page_size, kvh, hd)
         return k, v
 
     @staticmethod
@@ -239,9 +261,8 @@ class TokenspeedAttnBackend(AttentionBackend):
 
         req_to_token = self.req_to_token_pool.req_to_token
         max_kv = int(seq_lens.max().item()) if seq_lens.numel() else 0
-        page_table = req_to_token[forward_batch.req_pool_indices, :max_kv].to(
-            torch.int32
-        )
+        token_table = req_to_token[forward_batch.req_pool_indices, :max_kv]
+        page_table = self._to_block_table(token_table)
         max_q = int(extend_seq_lens.max().item()) if extend_seq_lens.numel() else 0
 
         res = tk.mha_extend_with_kvcache(
