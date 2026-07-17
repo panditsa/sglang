@@ -111,14 +111,51 @@ tokenspeed path correct. So:
    the exact aiter setup step and replicate it inside TokenspeedAttnBackend so
    the standalone path no longer needs the shadow.
 
-## Next step (well-scoped)
+## Session 2: side-effect hunt (eliminations)
 
-Diff aiter.forward_decode vs tokenspeed.forward_decode for the shared
-side-effect: candidate suspects are (a) aiter writing/refreshing the SWA
-out-cache-loc or page-table scatter buffers that the fused KV write consumes,
-(b) a workspace/init ordering, or (c) aiter's init_forward_metadata populating
-state the fused RoPE+set_kv path reads. Instrument both and compare the KV
-buffer + swa mapping immediately after each backend's forward on step 0.
+Ruled OUT, empirically:
+
+- Uninitialized output buffer: changing the sliding decode kernel's
+  `output = torch.empty(q.shape)` -> `torch.zeros(...)` did NOT fix it.
+- tokenspeed's own warmup/workspace: TS_SELF_SHADOW (run the tokenspeed decode
+  kernel 2x, discard the first) did NOT fix it. So it is specifically AITER's
+  computation that produces the fix, not a generic double-call.
+- SWA KV write correctness: the fused RoPE path
+  (fused_qk_rope_reshape_and_cache, kernels/ops/kvcache/rope_cache.py) DOES
+  handle SWA (HAS_SWA branch, pid_slot = swa_slot_mapping[pid_slot]), so the
+  SWA pool is written correctly regardless of attention backend.
+- Page-table validity: at the captured diverging step the SWA page table has
+  ZERO evicted (-1) and ZERO out-of-bounds entries in AND outside the window;
+  slots are all valid.
+- Window off-by-one: TS_WINDOW_OFFSET=-1 (keep 127, match aiter) did NOT fix
+  generation.
+
+NEW KEY OBSERVATION: the failure is NON-DETERMINISTIC. The same pure-tokenspeed
+config gives 5/7, 6/7 across identical runs, and the raw /v1/completions path
+(clean harmony prompt) produced the CORRECT answer where /v1/chat/completions
+(templated, longer) failed. Non-determinism at temp=0 with a fixed model =>
+tokenspeed's decode path reads memory that is sometimes-garbage, and aiter's
+prior read-only forward deterministically populates that region.
+
+Since (a) tokenspeed == its own SDPA (cos=1.0), (b) the output buffer zeroing
+doesn't help, and (c) self-shadow doesn't help but aiter-shadow does, the
+remaining suspect is a SHARED GPU SCRATCH/WORKSPACE inside the tokenspeed
+registry attention path that aiter's kernel initializes as a side effect
+(different allocation than tokenspeed's own), OR an ordering/stream hazard
+specific to running only the tokenspeed kernels back-to-back. This needs the
+tokenspeed-kernel authors' insight into the gfx950 MHA decode workspace/scratch
+allocation and any assumed-initialized global buffers.
+
+## Practical, correct workaround available today
+
+--attention-backend tokenspeed_verify  with TS_VERIFY_AUTH=test
+runs the tokenspeed attention kernels AUTHORITATIVELY (their output is used) and
+passes the failing prompts, because the aiter shadow-run initializes the shared
+region. ~2x attention cost. Proves the tokenspeed attention kernels are
+numerically production-correct; only the standalone-init path is missing.
+
+Recommended production config remains: --moe-runner-backend tokenspeed
+--attention-backend aiter (7/7, no shadow overhead).
 
 ## Artifacts
 

@@ -281,6 +281,16 @@ class TokenspeedAttnBackend(AttentionBackend):
             cache_seqlens = md.cache_seqlens
             max_seqlen_k = md.max_seq_len
 
+        import os
+
+        _shadow = int(os.environ.get("TS_SELF_SHADOW", "0"))
+        for _ in range(_shadow):
+            _r = tk.mha_decode_with_kvcache(
+                q_, k_cache, v_cache, page_table, cache_seqlens,
+                max_seqlen_k=max_seqlen_k, max_seqlen_q=1,
+                window_left=self._window_left(layer),
+                logit_cap=self._logit_cap(layer), sinks=sinks,
+            )
         res = tk.mha_decode_with_kvcache(
             q_,
             k_cache,
